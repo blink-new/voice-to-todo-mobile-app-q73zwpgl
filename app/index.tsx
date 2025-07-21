@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -9,11 +9,13 @@ import {
   TextInput,
   Modal,
   Platform,
+  Animated,
+  Dimensions,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system';
-import { Mic, MicOff, Check, Edit3, Trash2 } from 'lucide-react-native';
+import { Mic, MicOff, Check, Edit3, Trash2, Calendar, Bell } from 'lucide-react-native';
 import { blink } from '@/lib/blink';
 
 interface Task {
@@ -29,6 +31,8 @@ interface Task {
   updated_at: string;
 }
 
+const { width: screenWidth } = Dimensions.get('window');
+
 export default function VoiceToTodoApp() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [isRecording, setIsRecording] = useState(false);
@@ -40,6 +44,14 @@ export default function VoiceToTodoApp() {
   const [editTitle, setEditTitle] = useState('');
   const [editDeadline, setEditDeadline] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  
+  // Animation values
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const waveAnim1 = useRef(new Animated.Value(0.3)).current;
+  const waveAnim2 = useRef(new Animated.Value(0.5)).current;
+  const waveAnim3 = useRef(new Animated.Value(0.7)).current;
+  const recordingTimer = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const initializeApp = async () => {
@@ -61,6 +73,64 @@ export default function VoiceToTodoApp() {
     initializeApp();
   }, []);
 
+  // Pulse animation for recording button
+  useEffect(() => {
+    if (isRecording) {
+      const pulseAnimation = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, {
+            toValue: 1.1,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulseAnim, {
+            toValue: 1,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+        ])
+      );
+      pulseAnimation.start();
+
+      // Wave animations
+      const waveAnimation1 = Animated.loop(
+        Animated.sequence([
+          Animated.timing(waveAnim1, { toValue: 1, duration: 600, useNativeDriver: true }),
+          Animated.timing(waveAnim1, { toValue: 0.3, duration: 600, useNativeDriver: true }),
+        ])
+      );
+      const waveAnimation2 = Animated.loop(
+        Animated.sequence([
+          Animated.timing(waveAnim2, { toValue: 0.8, duration: 800, useNativeDriver: true }),
+          Animated.timing(waveAnim2, { toValue: 0.5, duration: 800, useNativeDriver: true }),
+        ])
+      );
+      const waveAnimation3 = Animated.loop(
+        Animated.sequence([
+          Animated.timing(waveAnim3, { toValue: 0.9, duration: 1000, useNativeDriver: true }),
+          Animated.timing(waveAnim3, { toValue: 0.7, duration: 1000, useNativeDriver: true }),
+        ])
+      );
+
+      waveAnimation1.start();
+      waveAnimation2.start();
+      waveAnimation3.start();
+
+      return () => {
+        pulseAnimation.stop();
+        waveAnimation1.stop();
+        waveAnimation2.stop();
+        waveAnimation3.stop();
+      };
+    } else {
+      Animated.timing(pulseAnim, {
+        toValue: 1,
+        duration: 200,
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [isRecording]);
+
   const loadTasks = async () => {
     try {
       if (!user?.id) return;
@@ -77,10 +147,57 @@ export default function VoiceToTodoApp() {
   const startRecording = async () => {
     try {
       if (Platform.OS === 'web') {
-        Alert.alert('Web Recording', 'Voice recording is not available on web. Please use the mobile app.');
+        // Web fallback - use browser's MediaRecorder API
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          Alert.alert('Not Supported', 'Voice recording is not supported in this browser. Please use the mobile app.');
+          return;
+        }
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const mediaRecorder = new MediaRecorder(stream);
+          const audioChunks: Blob[] = [];
+
+          mediaRecorder.ondataavailable = (event) => {
+            audioChunks.push(event.data);
+          };
+
+          mediaRecorder.onstop = async () => {
+            const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+            
+            // Convert to base64 for transcription
+            const reader = new FileReader();
+            reader.onload = async () => {
+              const dataUrl = reader.result as string;
+              const base64Data = dataUrl.split(',')[1];
+              await transcribeAudio(base64Data);
+            };
+            reader.readAsDataURL(audioBlob);
+
+            // Stop all tracks
+            stream.getTracks().forEach(track => track.stop());
+          };
+
+          mediaRecorder.start();
+          setIsRecording(true);
+          setRecordingDuration(0);
+
+          // Start timer
+          recordingTimer.current = setInterval(() => {
+            setRecordingDuration(prev => prev + 1);
+          }, 1000);
+
+          // Store mediaRecorder reference for stopping
+          (window as any).currentMediaRecorder = mediaRecorder;
+
+        } catch (error) {
+          Alert.alert('Permission Denied', 'Please allow microphone access to record voice notes.');
+          return;
+        }
         return;
       }
 
+      // Mobile recording with Expo AV
       const permission = await Audio.requestPermissionsAsync();
       if (permission.status !== 'granted') {
         Alert.alert('Permission required', 'Please grant microphone permission to record voice notes.');
@@ -92,12 +209,29 @@ export default function VoiceToTodoApp() {
         playsInSilentModeIOS: true,
       });
 
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
+      const { recording } = await Audio.Recording.createAsync({
+        ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
+        android: {
+          extension: '.wav',
+          outputFormat: Audio.AndroidOutputFormat.DEFAULT,
+          audioEncoder: Audio.AndroidAudioEncoder.DEFAULT,
+        },
+        ios: {
+          extension: '.wav',
+          outputFormat: Audio.IOSOutputFormat.LINEARPCM,
+          audioQuality: Audio.IOSAudioQuality.HIGH,
+        },
+      });
 
       setRecording(recording);
       setIsRecording(true);
+      setRecordingDuration(0);
+
+      // Start timer
+      recordingTimer.current = setInterval(() => {
+        setRecordingDuration(prev => prev + 1);
+      }, 1000);
+
     } catch (error) {
       console.error('Failed to start recording:', error);
       Alert.alert('Error', 'Failed to start recording. Please try again.');
@@ -105,17 +239,32 @@ export default function VoiceToTodoApp() {
   };
 
   const stopRecording = async () => {
-    if (!recording) return;
-
     try {
       setIsRecording(false);
       setIsTranscribing(true);
+
+      // Clear timer
+      if (recordingTimer.current) {
+        clearInterval(recordingTimer.current);
+        recordingTimer.current = null;
+      }
+
+      if (Platform.OS === 'web') {
+        const mediaRecorder = (window as any).currentMediaRecorder;
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+          mediaRecorder.stop();
+        }
+        return;
+      }
+
+      // Mobile recording stop
+      if (!recording) return;
 
       await recording.stopAndUnloadAsync();
       const uri = recording.getURI();
       
       if (uri) {
-        await transcribeAudio(uri);
+        await transcribeAudioFromFile(uri);
       }
 
       setRecording(null);
@@ -127,13 +276,22 @@ export default function VoiceToTodoApp() {
     }
   };
 
-  const transcribeAudio = async (audioUri: string) => {
+  const transcribeAudioFromFile = async (audioUri: string) => {
     try {
       // Read the audio file as base64
       const audioBase64 = await FileSystem.readAsStringAsync(audioUri, {
         encoding: FileSystem.EncodingType.Base64,
       });
 
+      await transcribeAudio(audioBase64);
+    } catch (error) {
+      console.error('File reading error:', error);
+      Alert.alert('Error', 'Failed to read audio file. Please try again.');
+    }
+  };
+
+  const transcribeAudio = async (audioBase64: string) => {
+    try {
       // Transcribe using Blink AI
       const { text } = await blink.ai.transcribeAudio({
         audio: audioBase64,
@@ -164,6 +322,9 @@ export default function VoiceToTodoApp() {
       });
 
       setTasks(prev => [newTask, ...prev]);
+      
+      // Show success feedback
+      Alert.alert('Task Created!', `"${transcription}" has been added to your tasks.`);
     } catch (error) {
       console.error('Error creating task:', error);
       Alert.alert('Error', 'Failed to create task. Please try again.');
@@ -177,7 +338,10 @@ export default function VoiceToTodoApp() {
         'Call dentist to schedule appointment',
         'Finish project presentation',
         'Walk the dog in the evening',
-        'Review quarterly budget'
+        'Review quarterly budget',
+        'Send follow-up email to client',
+        'Prepare for team meeting',
+        'Update portfolio website'
       ];
       
       const randomTask = sampleTasks[Math.floor(Math.random() * sampleTasks.length)];
@@ -200,12 +364,16 @@ export default function VoiceToTodoApp() {
 
   const toggleTaskCompletion = async (task: Task) => {
     try {
+      const newCompleted = task.completed ? 0 : 1;
+      
       await blink.db.tasks.update(task.id, {
-        completed: task.completed ? 0 : 1,
+        completed: newCompleted,
         updated_at: new Date().toISOString()
       });
 
-      setTasks(prev => prev.map(t => t.id === task.id ? { ...t, completed: task.completed ? 0 : 1 } : t));
+      setTasks(prev => prev.map(t => 
+        t.id === task.id ? { ...t, completed: newCompleted } : t
+      ));
     } catch (error) {
       console.error('Error updating task:', error);
     }
@@ -250,23 +418,35 @@ export default function VoiceToTodoApp() {
     }
   };
 
+  const formatDuration = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
   const renderTask = ({ item }: { item: Task }) => (
     <View style={styles.taskItem}>
       <TouchableOpacity
-        style={[styles.checkbox, item.completed ? styles.checkboxCompleted : null]}
+        style={[styles.checkbox, Number(item.completed) > 0 ? styles.checkboxCompleted : null]}
         onPress={() => toggleTaskCompletion(item)}
       >
-        {item.completed ? <Check size={16} color="#fff" /> : null}
+        {Number(item.completed) > 0 ? <Check size={16} color="#fff" /> : null}
       </TouchableOpacity>
       
       <View style={styles.taskContent}>
-        <Text style={[styles.taskTitle, item.completed ? styles.taskTitleCompleted : null]}>
+        <Text style={[
+          styles.taskTitle, 
+          Number(item.completed) > 0 ? styles.taskTitleCompleted : null
+        ]}>
           {item.title}
         </Text>
         {item.deadline && (
-          <Text style={styles.taskDeadline}>
-            Due: {new Date(item.deadline).toLocaleDateString()}
-          </Text>
+          <View style={styles.taskMeta}>
+            <Calendar size={12} color="#F59E0B" />
+            <Text style={styles.taskDeadline}>
+              Due: {new Date(item.deadline).toLocaleDateString()}
+            </Text>
+          </View>
         )}
       </View>
 
@@ -305,46 +485,107 @@ export default function VoiceToTodoApp() {
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Voice Tasks</Text>
         <Text style={styles.headerSubtitle}>
-          {Platform.OS === 'web' ? 'Add sample tasks to test the interface' : 'Tap to record, speak your task'}
+          {Platform.OS === 'web' 
+            ? 'Record voice notes in your browser or add sample tasks' 
+            : 'Tap to record, speak your task'
+          }
         </Text>
       </View>
 
-      {/* Recording Button */}
+      {/* Recording Section */}
       <View style={styles.recordingSection}>
-        <View style={styles.recordButton}>
+        {/* Voice Waveform Animation */}
+        {isRecording && (
+          <View style={styles.waveformContainer}>
+            <Animated.View style={[styles.waveBar, { 
+              height: 20,
+              opacity: waveAnim1,
+              transform: [{ scaleY: waveAnim1 }]
+            }]} />
+            <Animated.View style={[styles.waveBar, { 
+              height: 35,
+              opacity: waveAnim2,
+              transform: [{ scaleY: waveAnim2 }]
+            }]} />
+            <Animated.View style={[styles.waveBar, { 
+              height: 25,
+              opacity: waveAnim3,
+              transform: [{ scaleY: waveAnim3 }]
+            }]} />
+            <Animated.View style={[styles.waveBar, { 
+              height: 40,
+              opacity: waveAnim1,
+              transform: [{ scaleY: waveAnim1 }]
+            }]} />
+            <Animated.View style={[styles.waveBar, { 
+              height: 30,
+              opacity: waveAnim2,
+              transform: [{ scaleY: waveAnim2 }]
+            }]} />
+          </View>
+        )}
+
+        {/* Recording Button */}
+        <Animated.View style={[
+          styles.recordButton,
+          { transform: [{ scale: pulseAnim }] }
+        ]}>
           <TouchableOpacity
             style={[
               styles.recordButtonInner, 
               isRecording ? styles.recordButtonActive : null,
               isTranscribing ? styles.recordButtonProcessing : null
             ]}
-            onPress={Platform.OS === 'web' ? addSampleTask : (isRecording ? stopRecording : startRecording)}
+            onPress={isRecording ? stopRecording : (Platform.OS === 'web' ? startRecording : startRecording)}
             disabled={isTranscribing}
           >
             {isTranscribing ? (
-              <Text style={styles.recordButtonText}>Processing...</Text>
-            ) : Platform.OS === 'web' ? (
-              <Text style={styles.recordButtonText}>Add Sample Task</Text>
+              <View style={styles.buttonContent}>
+                <Text style={styles.recordButtonText}>Processing...</Text>
+              </View>
             ) : isRecording ? (
-              <MicOff size={32} color="#fff" />
+              <View style={styles.buttonContent}>
+                <MicOff size={32} color="#fff" />
+                <Text style={styles.recordButtonSubtext}>Tap to stop</Text>
+              </View>
             ) : (
-              <Mic size={32} color="#fff" />
+              <View style={styles.buttonContent}>
+                <Mic size={32} color="#fff" />
+                <Text style={styles.recordButtonSubtext}>
+                  {Platform.OS === 'web' ? 'Record Voice' : 'Record Task'}
+                </Text>
+              </View>
             )}
           </TouchableOpacity>
-        </View>
+        </Animated.View>
 
-        {/* Recording Indicator */}
+        {/* Recording Status */}
         {isRecording && (
           <View style={styles.recordingIndicator}>
             <View style={styles.recordingDot} />
-            <Text style={styles.recordingText}>Recording...</Text>
+            <Text style={styles.recordingText}>
+              Recording... {formatDuration(recordingDuration)}
+            </Text>
           </View>
+        )}
+
+        {/* Web Sample Button */}
+        {Platform.OS === 'web' && !isRecording && (
+          <TouchableOpacity style={styles.sampleButton} onPress={addSampleTask}>
+            <Text style={styles.sampleButtonText}>+ Add Sample Task</Text>
+          </TouchableOpacity>
         )}
       </View>
 
       {/* Task List */}
       <View style={styles.taskListContainer}>
-        <Text style={styles.taskListTitle}>Your Tasks ({tasks.length})</Text>
+        <View style={styles.taskListHeader}>
+          <Text style={styles.taskListTitle}>Your Tasks</Text>
+          <View style={styles.taskCounter}>
+            <Text style={styles.taskCountText}>{tasks.length}</Text>
+          </View>
+        </View>
+        
         <FlatList
           data={tasks}
           renderItem={renderTask}
@@ -353,10 +594,11 @@ export default function VoiceToTodoApp() {
           showsVerticalScrollIndicator={false}
           ListEmptyComponent={
             <View style={styles.emptyState}>
+              <Mic size={48} color="#D1D5DB" />
               <Text style={styles.emptyStateText}>No tasks yet</Text>
               <Text style={styles.emptyStateSubtext}>
                 {Platform.OS === 'web' 
-                  ? 'Tap the button above to add a sample task'
+                  ? 'Record your first voice note or add a sample task'
                   : 'Record your first voice note above'
                 }
               </Text>
@@ -438,10 +680,25 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#6B7280',
     textAlign: 'center',
+    lineHeight: 22,
   },
   recordingSection: {
     alignItems: 'center',
     paddingVertical: 40,
+    minHeight: 200,
+  },
+  waveformContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 20,
+    height: 50,
+  },
+  waveBar: {
+    width: 4,
+    backgroundColor: '#6366F1',
+    marginHorizontal: 2,
+    borderRadius: 2,
   },
   recordButton: {
     width: 120,
@@ -469,12 +726,20 @@ const styles = StyleSheet.create({
   recordButtonProcessing: {
     backgroundColor: '#F59E0B',
   },
+  buttonContent: {
+    alignItems: 'center',
+  },
+  recordButtonSubtext: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '500',
+    marginTop: 4,
+  },
   recordButtonText: {
     color: '#fff',
     fontSize: 14,
     fontWeight: '500',
     textAlign: 'center',
-    paddingHorizontal: 10,
   },
   recordingIndicator: {
     flexDirection: 'row',
@@ -493,15 +758,45 @@ const styles = StyleSheet.create({
     color: '#EF4444',
     fontWeight: '500',
   },
+  sampleButton: {
+    marginTop: 16,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    backgroundColor: '#E5E7EB',
+    borderRadius: 20,
+  },
+  sampleButtonText: {
+    color: '#6B7280',
+    fontSize: 14,
+    fontWeight: '500',
+  },
   taskListContainer: {
     flex: 1,
     paddingHorizontal: 24,
+  },
+  taskListHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 16,
   },
   taskListTitle: {
     fontSize: 20,
     fontWeight: '600',
     color: '#111827',
-    marginBottom: 16,
+  },
+  taskCounter: {
+    backgroundColor: '#6366F1',
+    borderRadius: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    minWidth: 24,
+    alignItems: 'center',
+  },
+  taskCountText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
   },
   taskList: {
     flex: 1,
@@ -540,15 +835,22 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#111827',
     lineHeight: 20,
+    fontWeight: '500',
   },
   taskTitleCompleted: {
     textDecorationLine: 'line-through',
     color: '#6B7280',
   },
+  taskMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 4,
+  },
   taskDeadline: {
     fontSize: 12,
     color: '#F59E0B',
-    marginTop: 4,
+    marginLeft: 4,
+    fontWeight: '500',
   },
   taskActions: {
     flexDirection: 'row',
@@ -559,17 +861,20 @@ const styles = StyleSheet.create({
   },
   emptyState: {
     alignItems: 'center',
-    paddingVertical: 40,
+    paddingVertical: 60,
   },
   emptyStateText: {
     fontSize: 18,
     color: '#6B7280',
     marginBottom: 4,
+    marginTop: 16,
+    fontWeight: '500',
   },
   emptyStateSubtext: {
     fontSize: 14,
     color: '#9CA3AF',
     textAlign: 'center',
+    lineHeight: 20,
   },
   modalContainer: {
     flex: 1,
